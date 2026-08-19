@@ -22,10 +22,13 @@
 | head 1
 | eval soc='battery.soc'
 | fields soc</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
         <option name="drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
         <option name="unit">%</option>
         <option name="rangeColors">["0xdc4e41","0xf8be34","0x53a051"]</option>
         <option name="rangeValues">[20,50]</option>
@@ -41,6 +44,8 @@
 | head 1
 | eval t='temp.motor_max'
 | fields t</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -60,6 +65,8 @@
 | head 1
 | eval hz='topic_hz.lowstate'
 | fields hz</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -72,13 +79,15 @@
     </panel>
 
     <panel>
-      <title>Consumo de licencia (hoy)</title>
+      <title>Enviado hoy (licencia)</title>
       <single>
         <search>
-          <query>index=go2-robot-data sourcetype=robot:health
+          <query>index=go2-robot-data sourcetype=robot:shipper
 | head 1
 | eval mb=round('sent_bytes_today'/1024/1024,1)
 | fields mb</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -116,6 +125,8 @@
 | eval cambio=prev." -&gt; ".curr
 | table _time kind cambio robot
 | sort - _time</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -132,7 +143,10 @@
       <chart>
         <search>
           <query>index=go2-robot-data sourcetype=robot:vitals
-| timechart span=1m avg('battery.soc') as "SOC (%)", avg('power.volt') as "Voltaje (V)"</query>
+| eval soc='battery.soc', volt='power.volt'
+| timechart span=1m avg(soc) as "SOC (%)", avg(volt) as "Voltaje (V)"</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -147,7 +161,10 @@
       <chart>
         <search>
           <query>index=go2-robot-data sourcetype=robot:vitals
-| timechart span=1m max('temp.motor_max') as "Motor máx", avg('temp.ntc1') as "NTC1", avg('temp.ntc2') as "NTC2", avg('imu.temp') as "IMU"</query>
+| eval mt='temp.motor_max', n1='temp.ntc1', n2='temp.ntc2', it='imu.temp'
+| timechart span=1m max(mt) as "Motor máx", avg(n1) as "NTC1", avg(n2) as "NTC2", avg(it) as "IMU"</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -172,6 +189,8 @@
 | rex field=campo "^(?&lt;junta&gt;[A-Z]{2}_[a-z]+)\.(?&lt;metrica&gt;\w+)$"
 | where isnotnull(junta)
 | chart values(valor) over junta by metrica</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
@@ -192,6 +211,8 @@
 | head 20
 | table _time mode gait_type error_code body_height yaw_speed
 | sort - _time</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
           <earliest>$tr.earliest$</earliest>
           <latest>$tr.latest$</latest>
         </search>
