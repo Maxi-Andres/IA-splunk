@@ -37,7 +37,7 @@ timeout 3 bash -c '</dev/tcp/192.168.20.200/8088' && echo ABIERTO || echo cerrad
 **A5. Prueba de humo con `curl`** — antes de meter DDS en el medio:
 ```bash
 curl -k https://192.168.20.200:8088/services/collector/event \
-  -H "Authorization: Splunk <TOKEN>" \
+  -H "Authorization: Splunk $TOK" \
   -d '{"event":{"hola":"mundo"},"sourcetype":"robot:test","index":"go2-robot-data"}'
 ```
 Esperado: `{"text":"Success","code":0}`. Después, en Splunk: `index=go2-robot-data`.
@@ -155,37 +155,173 @@ peers unicast.
 
 ---
 
-## Etapa D — Recién acá, el robot
+## Etapa D — El agente adentro del robot
 
 **No empezar hasta que la Etapa B esté andando sostenida.** El agente de producción es un
-binario nativo en C++ (el SDK trae libs aarch64 precompiladas, y el Jetson ya tiene
-g++ 9.4.0 + cmake), así que **no hace falta ROS2 en el robot**.
+binario nativo en C++: el SDK trae librerías aarch64 precompiladas y el Jetson ya tiene
+g++ 9.4 + cmake, así que **no hace falta instalar ROS2 ni nada más en el robot**.
 
-Orden, y el motivo de cada paso:
+Código: `~/Desktop/robot-splunk-bridge/` (repo propio). Verificado antes de desplegar:
+el lector **compila limpio** y el shipper **pasó 4 tests** contra el HEC real (envío
+normal, spool con enlace caído, drenado al volver, y 4xx que no se reintenta).
 
-**D1. Compilar en el Jetson, sin instalar nada.** Copiar el fuente y el SDK, compilar ahí.
-Si algo falta, te enterás antes de tocar servicios.
+### D0 — Publicar el repo (una vez, desde esta PC)
 
-**D2. Correrlo a mano, en primer plano.** Con `--dry-run` primero, después contra el HEC.
-Lo ves funcionar, lo cortás con Ctrl-C. Sin systemd, sin nada persistente.
+Con el repo en un remoto, actualizar el robot después es `git pull` en vez de copiar
+archivos a mano.
 
-**D3. Dejarlo corriendo una hora a mano** y mirar el consumo (`top`) y el dashboard.
-
-**D4. Recién entonces, el servicio systemd** — con `Restart=always` y límites de recursos:
-```ini
-MemoryMax=256M
-CPUQuota=25%
-Nice=10
+```bash
+cd ~/Desktop/robot-splunk-bridge
+git remote add origin https://github.com/Maxi-Andres/IA-splunk-bridge.git
+git push -u origin main
 ```
-El agente es **read-only**: se suscribe y nada más, no publica en ningún tópico de comando.
 
-**D5. Probar el corte de enlace** a propósito y confirmar que el spool en disco drena sin
-perder ni duplicar datos (hay 429 GB libres en el Jetson).
+> Si el repo es **privado**, el robot necesita credenciales para clonar. Usá una
+> **deploy key de solo lectura**, no un token de cuenta — la password SSH del robot es
+> `123`, así que cualquier credencial que dejes ahí hay que asumirla expuesta.
 
-**Criterio de salida:** el agente corriendo como servicio en el robot, sobreviviendo a un
-corte de red y a un reinicio.
+### D1 — Clonar en el robot (una vez)
 
----
+El SDK se clona del upstream oficial: nuestra copia local **no tiene modificaciones**, y
+el robot tiene internet (verificado: 8.8.8.8 en 2,86 ms, DNS resolviendo). Así te ahorrás
+copiar 84 MB.
+
+```bash
+ssh unitree@192.168.123.18
+
+git clone https://github.com/unitreerobotics/unitree_sdk2.git ~/unitree_sdk2
+git clone https://github.com/Maxi-Andres/IA-splunk-bridge.git ~/robot-splunk-bridge
+```
+
+### D2 — Compilar
+
+```bash
+cd ~/robot-splunk-bridge && ./build.sh
+```
+
+`build.sh` corre `g++` una sola vez y elige la librería del SDK según `uname -m`, así que
+en el Jetson toma `lib/aarch64/` automáticamente.
+
+✅ **Qué mirar:** `built ./telemetry_reader (aarch64)`. Si dice `x86_64`, algo anda mal.
+
+### D3 — Dry run: el paso que demuestra la arquitectura
+
+Corre **solo el lector**, sin el shipper. Se suscribe al DDS e imprime el JSON por
+pantalla. **No manda nada a ninguna parte** — no hay token ni salida de red.
+
+```bash
+./telemetry_reader | head -5
+```
+
+✅ **Qué mirar:** líneas con `"sourcetype":"robot:vitals"` y adentro `"soc"`, temperaturas
+de motor, IMU. Si sale eso, **el agente está leyendo DDS adentro del robot mientras la PC
+del escritorio, en otra subred, no ve absolutamente nada** — que es todo el punto del
+diseño.
+
+❌ **Si sale vacío:** el lector corre pero no llega DDS. Revisar `DDS_IFACE` (default
+`eth0`, que es la interfaz correcta del Jetson: `192.168.123.18`).
+
+✅ **EJECUTADO 2026-08-19 — funcionó.** `built ./telemetry_reader (aarch64)` y el dry run
+devolvió telemetría real (`soc:96`, temperaturas de motor 27-34 °C, IMU, pose) **con la PC
+del escritorio en la VLAN 20 sin ver ni un tópico DDS**. La arquitectura queda demostrada
+end-to-end. Los timestamps del robot coinciden con los de la PC → NTP confirmado.
+
+Hallazgo del dato real: **`lost` no es cero en 3 de las 12 juntas** (`FR_hip`, `RL_thigh`,
+`RL_calf` en 5). Es un contador acumulado, estable entre muestras, así que no es una falla
+activa — pero en el dashboard hay que graficar su **derivada**, no el valor absoluto: un
+`lost` que crece significa comunicación degradándose con ese motor.
+
+### D4 — El token, afuera del repo
+
+```bash
+printf '%s' 'PEGA-EL-TOKEN-ACA' > ~/.splunk_hec_token
+chmod 600 ~/.splunk_hec_token
+```
+
+⚠️ **No usar `read` acá.** Si pegás un bloque de varias líneas, `read` se come la línea
+siguiente como si fuera lo que escribiste, y el token queda con basura adentro. El síntoma
+es confuso: `Invalid header value`, que parece un bug del código y en realidad es el
+archivo del token. `run.sh` ahora limpia espacios al leerlo y el shipper valida el
+contenido, pero igual conviene no usar `read` en algo copiable.
+
+Verificá que quedó bien antes de seguir:
+```bash
+cat ~/.splunk_hec_token; echo      # una sola linea, solo el UUID
+```
+
+Va en un archivo y no en la línea de comandos, así no queda en el historial de bash ni
+visible en `ps` para otros usuarios. **Y vive fuera del repo**, así que ni se sube con un
+push ni se pisa con un pull.
+
+### D5 — La cadena completa, en primer plano
+
+```bash
+HEC_URL=https://192.168.20.200:8088/services/collector/event ./run.sh
+```
+
+`run.sh` arma `telemetry_reader | hec_shipper.py`. En primer plano, para verlo funcionar y
+cortarlo con Ctrl-C.
+
+✅ **Qué mirar:** la línea `[shipper] up: url=...` y **silencio después**. El shipper solo
+habla cuando algo falla, así que sin mensajes = todo entrando. Y en Splunk,
+`index=go2-robot-data` empieza a llenarse.
+
+### D6 — Dejarlo una hora a mano
+
+Mirando `top` (el agente debería ser invisible: el Jetson está a load average 0,00) y el
+dashboard. Recién después, el servicio.
+
+### D7 — El servicio systemd
+
+Esto convierte el D5 —que muere al cerrar la terminal— en algo permanente.
+
+```bash
+sudo cp systemd/robot-splunk-bridge.service /etc/systemd/system/
+sudo systemctl enable --now robot-splunk-bridge
+journalctl -u robot-splunk-bridge -f          # Ctrl-C corta la vista, no el servicio
+```
+
+| Comando | Qué hace |
+|---|---|
+| `sudo cp` | Le da de alta el servicio a systemd |
+| `systemctl enable` | Lo marca para **arrancar en cada boot del robot** |
+| `--now` | Y lo arranca ya, sin esperar reinicio |
+| `journalctl -f` | Logs en vivo |
+
+Lo que el unit garantiza:
+
+- **`Restart=always` + `RestartSec=5`** — si el agente se cae, systemd lo revive en 5 s.
+- **`MemoryMax=256M`, `CPUQuota=25%`, `Nice=10`** — techo duro del kernel: **no puede**
+  competir por CPU o memoria con el stack que hace caminar al robot, ni con un bug.
+- **`StartLimitBurst=5` en 120 s** — corta el loop de crasheo.
+- El agente es **read-only**: se suscribe y nada más, no publica en ningún tópico de
+  comando. No puede mover el robot.
+
+### D8 — Probar el corte de enlace
+
+```bash
+# desde el robot, cortar la salida a Splunk un rato y volver a habilitarla
+sudo ip route del default
+# ...esperar un minuto...
+sudo ip route add default via 192.168.123.1
+ls /var/tmp/robot-splunk-spool/       # deberia vaciarse al volver
+```
+
+✅ Los eventos atrasados caen en Splunk **con su timestamp original**, porque cada evento
+lleva su propio `time`. Un corte se convierte en un retraso, no en un agujero.
+
+### Actualizar el agente después
+
+```bash
+ssh unitree@192.168.123.18 'cd ~/robot-splunk-bridge && git pull && ./build.sh && sudo systemctl restart robot-splunk-bridge'
+```
+
+⚠️ **El `./build.sh` no es opcional:** el binario está en `.gitignore`, así que un `git
+pull` trae el fuente nuevo pero **no** recompila. Sin ese paso seguís corriendo el binario
+viejo.
+
+**Criterio de salida:** el agente corriendo como servicio, sobreviviendo a un corte de red
+y a un reinicio del robot.
 
 ## Lo que YA está hecho
 
