@@ -1,0 +1,186 @@
+<form version="1.1" theme="dark">
+  <label>Robot Go2 — Telemetría</label>
+  <description>Telemetría en vivo del Unitree Go2 vía HEC. Video embebido desde mediamtx.</description>
+
+  <fieldset submitButton="false" autoRun="true">
+    <input type="time" token="tr">
+      <label>Rango</label>
+      <default>
+        <earliest>-60m</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+  </fieldset>
+
+  <!-- ============ FILA 1: estado de un vistazo ============ -->
+  <row>
+    <panel>
+      <title>Batería</title>
+      <single>
+        <search>
+          <query>index=go2-robot-data sourcetype=robot:vitals
+| head 1
+| eval soc='battery.soc'
+| fields soc</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="unit">%</option>
+        <option name="rangeColors">["0xdc4e41","0xf8be34","0x53a051"]</option>
+        <option name="rangeValues">[20,50]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+
+    <panel>
+      <title>Temp. máx. de motor</title>
+      <single>
+        <search>
+          <query>index=go2-robot-data sourcetype=robot:vitals
+| head 1
+| eval t='temp.motor_max'
+| fields t</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="unit">°C</option>
+        <option name="rangeColors">["0x53a051","0xf8be34","0xdc4e41"]</option>
+        <option name="rangeValues">[60,80]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+
+    <panel>
+      <title>DDS vivo (Hz de /lf/lowstate)</title>
+      <single>
+        <search>
+          <query>index=go2-robot-data sourcetype=robot:health
+| head 1
+| eval hz='topic_hz.lowstate'
+| fields hz</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="unit">Hz</option>
+        <option name="rangeColors">["0xdc4e41","0x53a051"]</option>
+        <option name="rangeValues">[0.1]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+
+    <panel>
+      <title>Consumo de licencia (hoy)</title>
+      <single>
+        <search>
+          <query>index=go2-robot-data sourcetype=robot:health
+| head 1
+| eval mb=round('sent_bytes_today'/1024/1024,1)
+| fields mb</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="unit">MB</option>
+      </single>
+    </panel>
+  </row>
+
+  <!-- ============ FILA 2: video + eventos ============ -->
+  <row>
+
+    <panel>
+      <title>Eventos discretos (cambios de modo, errores, sobretemperatura)</title>
+      <table>
+        <search>
+          <query>index=go2-robot-data sourcetype=robot:event
+| eval cambio=prev." -&gt; ".curr
+| table _time kind cambio robot
+| sort - _time</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="count">15</option>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ============ FILA 3: series temporales ============ -->
+  <row>
+    <panel>
+      <title>Batería: carga y voltaje</title>
+      <chart>
+        <search>
+          <query>index=go2-robot-data sourcetype=robot:vitals
+| timechart span=1m avg('battery.soc') as "SOC (%)", avg('power.volt') as "Voltaje (V)"</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.axisTitleY.text">SOC / Volt</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+
+    <panel>
+      <title>Temperaturas</title>
+      <chart>
+        <search>
+          <query>index=go2-robot-data sourcetype=robot:vitals
+| timechart span=1m max('temp.motor_max') as "Motor máx", avg('temp.ntc1') as "NTC1", avg('temp.ntc2') as "NTC2", avg('imu.temp') as "IMU"</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.axisTitleY.text">°C</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ============ FILA 4: motores y pose ============ -->
+  <row>
+    <panel>
+      <title>Motores — último estado por junta</title>
+      <table>
+        <search>
+          <query>index=go2-robot-data sourcetype=robot:motors
+| head 1
+| fields "*.temp" "*.tau" "*.q" "*.lost"
+| transpose 0 column_name=campo
+| rename "row 1" as valor
+| rex field=campo "^(?&lt;junta&gt;[A-Z]{2}_[a-z]+)\.(?&lt;metrica&gt;\w+)$"
+| where isnotnull(junta)
+| chart values(valor) over junta by metrica</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="count">12</option>
+        <option name="drilldown">none</option>
+        <format type="color" field="temp">
+          <colorPalette type="list">[#53a051,#f8be34,#dc4e41]</colorPalette>
+          <scale type="threshold">60,80</scale>
+        </format>
+      </table>
+    </panel>
+
+    <panel>
+      <title>Pose y modo</title>
+      <table>
+        <search>
+          <query>index=go2-robot-data sourcetype=robot:pose
+| head 20
+| table _time mode gait_type error_code body_height yaw_speed
+| sort - _time</query>
+          <earliest>$tr.earliest$</earliest>
+          <latest>$tr.latest$</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+</form>

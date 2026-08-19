@@ -1,11 +1,34 @@
 # Plan de telemetría de robots Unitree → Splunk
 
-Revisión del plan original (`Telemetria-Splunk.md`) contra el estado real del stack que ya
-corre en esta máquina. Fecha: 2026-08-18.
+Revisión del plan original (`Telemetria-Splunk.md`) contra el estado real del stack.
+Fundamento técnico de red y DDS: **`RED-Y-DDS.md`**. Mediciones: **`CENSO-GO2.md`**.
+Red, VPN y transporte: **`PLAN-CONECTIVIDAD-ROBOTS.md`** (es la autoridad sobre esa capa; este
+documento es la autoridad sobre el colector y el contrato de datos).
 
-**Cambio conceptual respecto del plan original:** el diseño no puede ser *"reenviar topics
-DDS a Splunk"*. Tiene que ser **"extraer campos específicos y mandarlos a tasa controlada"**.
-El motivo es aritmético y está en §4.
+- Creado: 2026-08-18
+- **Revisado 2026-08-19: cambio de premisa mayor — ver §0.**
+
+---
+
+## 0. Las dos decisiones que definen el plan
+
+**Decisión 1 — extraer campos, no reenviar tópicos.** El diseño no puede ser *"reenviar
+tópicos DDS a Splunk"*, tiene que ser *"extraer campos específicos a tasa controlada"*. Motivo
+aritmético en §5.1: incluso el tópico más liviano, reenviado tal cual, es 20-35x el presupuesto
+de licencia.
+
+**Decisión 2 (2026-08-19) — el agente corre ADENTRO del robot.** Requisito nuevo del usuario:
+los robots tienen que poder estar **en cualquier red** — en el campo con Starlink, con LTE, en
+otra oficina — así que **no se puede asumir que compartan subred con nada**. Eso invalida todo
+el diseño anterior de "un collector con presencia L2 en la red del robot" (VM en el trunk,
+VLAN por robot, sub-interfaces taggeadas).
+
+La observación que lo resuelve:
+
+> **La única máquina que va a estar L2-adyacente al DDS del robot, esté el robot donde esté, es
+> el robot mismo.**
+
+Entonces el lector va adentro del robot, y lo que sale es **HTTPS saliente**. Ver §2.
 
 ---
 
@@ -15,30 +38,114 @@ Ver en un dashboard de Splunk, en una sola vista: **video en vivo, batería, tem
 estado de motores, errores/faults y posición** de los robots Unitree.
 
 - **Ahora:** un solo robot, el **Go2 (perro)**.
-- **Después:** los dos (Go2 + G1). El diseño se hace multi-robot desde el día uno (campo
-  `robot` en cada evento, config por robot), pero **no se implementa la parte de dos robots
-  hasta que esté definida la topología de red** — ver §5.
+- **Después:** los dos (Go2 + G1), y con la premisa nueva, **N robots en N redes distintas**.
+  El diseño es multi-robot desde el día uno (campo `robot` en cada evento, config por robot).
+- **Requisito de movilidad:** el robot tiene que poder reportar desde cualquier red con salida
+  a internet, sin configuración de red del lado del robot y sin puertos entrantes.
 - **Fuera de alcance:** indexar video o nubes de puntos en Splunk. El video se muestra
-  embebido desde el pipeline que ya existe; no consume licencia.
+  embebido; no consume licencia.
 
 ---
 
-## 2. Arquitectura
+## 2. La decisión de arquitectura: el agente va en el robot
+
+### 2.1. Opciones evaluadas
+
+**Opción A — Agente adentro del robot, HTTPS saliente** ✅ **elegida**
+
+| Pros | Contras |
+|---|---|
+| **Funciona desde cualquier red**: Starlink, LTE, WiFi ajeno. Es el único que cumple el requisito | Hay que desplegar y mantener software **en el robot** |
+| Atraviesa NAT sin configurar nada: solo conexiones **salientes** | Hay que tener cuidado de no desestabilizar el robot (agente read-only, con límite de recursos) |
+| **El conflicto de `.161` desaparece**: la IP queda privada dentro de cada robot, nunca se expone. N robots, todos `.161`, sin pisarse | El robot necesita poder alcanzar el HEC de Splunk (§8) |
+| Ancho de banda trivial: ~45 MB/día curados. Ideal para un enlace satelital | Depende del reloj del robot (§7.4) |
+| **No hace falta trunk, ni VLAN por robot, ni sub-interfaces, ni VM collector.** Todo eso existía para darle presencia L2 a un lector remoto — problema que se elimina | |
+| El SDK trae **libs aarch64 precompiladas** → compilar en el Jetson es un trámite | |
+| Ya está medido que PC2 del G1 lee el DDS de PC1 por el bus interno **con el cable externo desenchufado** (0,16 ms) | |
+
+**Opción B — Túnel L2 (extender la red del robot por internet)** ❌
+
+Traer la `192.168.123.0/24` del robot hasta el server por un túnel (ZeroTier con bridging L2,
+WireGuard + bridge, etc.), para que el lector remoto siga creyendo que está en la misma red.
+
+| Pros | Contras |
+|---|---|
+| No se toca nada en el robot ni en el server | **DDS sobre WAN se degrada muy mal**: RTT alto, jitter y pérdida, con QoS RELIABLE = tormentas de retransmisión |
+| Conceptualmente simple | **Manda los tópicos completos por el enlace**: los 2,2 MB/s de `rt/lowstate` cruzarían el Starlink |
+| | **Imposible para dos robots**: dos túneles presentando `192.168.123.161` cada uno = conflicto de IP en el server. Sin salida |
+| | El discovery multicast sobre túnel es frágil |
+
+**Opción C — DDS Router / bridge Zenoh (`zenoh-bridge-dds`, eProsima DDS Router)** 🟡 archivada
+
+Herramientas hechas exactamente para puentear DDS por WAN sin extender L2.
+
+| Pros | Contras |
+|---|---|
+| Preserva la semántica de tópicos: si algún día hace falta **comandar** el robot en el campo o que AI-VL lo vea, es la herramienta correcta | Igual **hay que correr un proceso en el robot** — mismo costo de despliegue que la Opción A |
+| Bidireccional | Reenvía tópicos completos → mucho más ancho de banda que campos curados |
+| Maduro y usado en producción | Una pieza más que mantener, para un problema que la Opción A ya resuelve |
+
+**Veredicto:** para telemetría a Splunk es sobredimensionado. **Queda anotada como el camino
+correcto si más adelante se quiere teleoperación o AI-VL contra un robot remoto** — esa
+conversación es distinta y esta es la respuesta.
+
+**Opción D — VM collector con presencia L2 en la red del robot** ❌ descartada por el requisito
+
+Era la recomendación de la revisión anterior (VM `Splunk-collector` en el portgroup
+`TRUNK ITINERANTE`, VLAN 4095/VGT, con una sub-interfaz taggeada por robot). Técnicamente
+correcta, pero **solo sirve si el robot está en una VLAN que llega al server** — exactamente lo
+que el requisito nuevo prohíbe asumir. Se descarta como arquitectura.
+
+> Lo que sí sobrevive de esa investigación: si algún robot **está** en la LAN local, el mismo
+> agente puede correr fuera del robot sin cambiar una línea de código (todo es configuración).
+> Y para el trial, el agente va a correr en esta PC justamente así (§11).
+
+### 2.2. Arquitectura resultante
 
 ```
-┌──────────────┐   DDS (CycloneDDS)   ┌────────────────────┐   HTTPS/HEC   ┌──────────┐
-│  Go2 (perro) │ ───rt/lowstate──────▶│  telemetry-bridge  │ ─────────────▶│  Splunk  │
-│ .123.161     │    rt/sportmodestate │  (SDK nativo C++   │  NDJSON       │ .20.200  │
-└──────────────┘    rt/lidarstate     │   + shipper Python)│  batches      └──────────┘
-                                      └────────────────────┘                    ▲
-┌──────────────┐   DDS (videohub)     ┌────────────────────┐                    │ iframe
-│  Go2 cámara  │ ───JPEG─────────────▶│ robot-nvr-bridge   │ ── HLS/WebRTC ─────┘
-└──────────────┘                      │ (YA FUNCIONANDO)   │    :8888 / :8889
-                                      └────────────────────┘
+        ┌─────────── ROBOT (en cualquier red) ────────────┐
+        │                                                  │
+        │  bajo nivel .123.161 ──DDS──▶ agente             │        ┌──────────┐
+        │  (bus interno, nunca sale)    (Jetson .123.18)   │        │  Splunk  │
+        │                                     │            │        │  HEC     │
+        └─────────────────────────────────────┼────────────┘        └────▲─────┘
+                                              │                          │
+                                              └── HTTPS saliente ────────┘
+                                             (Starlink / LTE / WiFi, vía §8)
+
+  DDS: corto, local, adentro del robot.      HTTPS: largo, ruteado, atraviesa NAT.
 ```
 
-Dos caminos independientes que se cruzan solo en el dashboard, correlacionados por
-timestamp. Si se cae uno, el otro sigue.
+**DDS corto y local, HTTPS largo y ruteado.** Es la misma tesis de `RED-Y-DDS.md` §8, llevada
+a su conclusión: si el DDS tiene que ser local, entonces el lector va donde está el DDS.
+
+### 2.3. Dónde corre, por robot
+
+| Robot | Host del agente | Acceso | Estado |
+|---|---|---|---|
+| **Go2** | Jetson `192.168.123.18` | SSH `unitree` | ✅ **Inventariado 2026-08-19 — viable** (abajo) |
+| **G1** | PC2 / Jetson `192.168.123.164` (aarch64, Ubuntu 20.04) | SSH | Lectura de DDS de PC1 por bus interno **ya validada** |
+
+### Inventario del Jetson del Go2 (verificado 2026-08-19)
+
+| Aspecto | Valor | Implicancia |
+|---|---|---|
+| Arquitectura / OS | **aarch64**, Ubuntu 20.04.5, kernel 5.10.104-tegra | El SDK trae lib aarch64 precompilada → compila directo |
+| Toolchain | **g++ 9.4.0, cmake, make, git** | No hay que instalar nada para compilar |
+| Recursos | 4 cores, **15,4 GB RAM (14,2 libres)**, **469 GB disco (429 libres)** | Sobra. El spool puede ser generoso |
+| Carga | **load average 0,00** — idle | El agente no compite con nada |
+| Ruteo | `default via 192.168.123.1 dev eth0` | **Tiene default gateway** → puede salir de la 123 |
+| Internet | ping 8.8.8.8 en **2,86 ms**, DNS resolviendo | **Puede alcanzar Splunk** (y un futuro endpoint remoto) |
+| Reloj | NTP **activo y sincronizado**; TZ Asia/Shanghai (fábrica) | Correcto en UTC. El agente debe emitir **epoch**, y la TZ es irrelevante |
+| ROS2 | Foxy (y ROS1 Noetic) instalados | No se usan: el SDK nativo evita depender de ellos |
+| **Software de terceros ya corriendo** | contenedor `go2-jetson-01` = **ThousandEyes enterprise-agent (Cisco)** | **Hay precedente de agentes de terceros en el robot, desplegados como Docker** |
+
+Ese último punto es el más importante: **el riesgo de "no nos dejan instalar software en el robot"
+ya está resuelto en la práctica**, y además muestra el patrón aceptado (contenedor Docker).
+
+Nota sobre el G1: **PC1 (`.161`) no tiene SSH en ningún puerto**, así que ahí no se puede
+desplegar nada — pero no hace falta: PC2 lee el DDS de PC1 por el bus interno. Y con el camino
+del SDK nativo, el ROS2 Foxy pelado de PC2 deja de ser un problema (§7.1).
 
 ---
 
@@ -50,339 +157,367 @@ timestamp. Si se cae uno, el otro sigue.
 |---|---|---|
 | Captura de video del robot → RTSP/HLS/WebRTC | `robot-nvr-bridge` (mediamtx + ffmpeg) | Funcionando, con systemd y auto-reinicio |
 | NVR con grabación continua y timeline | `robot-nvr-bridge/frigate` | Funcionando, 3 días de retención |
-| SDK de Unitree compilado en Ubuntu 26.04 | `unitree_sdk2` + `robot-nvr-bridge/build.sh` | Probado — es el patrón a reusar |
+| Patrón de compilación contra el SDK | `robot-nvr-bridge/build.sh` | Probado en Ubuntu 26.04 |
+| **Libs del SDK para aarch64** | `unitree_sdk2/lib/aarch64/` + `thirdparty/lib/aarch64/` | Precompiladas; el `CMakeLists.txt` elige por arquitectura |
 | Tipos de mensaje de **los dos** robots | `unitree_sdk2/include/unitree/idl/{go2,hg}/` | `LowState_`, `IMUState_`, `BmsState_`, `MotorState_`, `SportModeState_` |
-| ROS2 Humble + msgs de Unitree (alternativa) | devcontainer `unitree_ros2_devcontainer-...-humble` | Funcionando, pero ver §7.1 |
-| Transporte DDS parametrizado (interfaz + peers unicast) | `unitree_ros2/setup.sh` + `dds.env` | Reusable como referencia de config |
-| Camino de red de esta PC a Splunk | verificado 2026-08-18 | ruta vía `192.168.123.1`, **0.55 ms**, puertos 8000 y 8089 abiertos |
-| Portgroup de trunk en el ESXi | `TRUNK ITINERANTE`, VLAN ID 4095 (VGT) | Ya existe, y `Splunk-collector` ya está atachada |
+| Transporte DDS parametrizado | `unitree_ros2/setup.sh` + `dds.env` | Referencia de config |
+| Camino de esta PC a Splunk | verificado 2026-08-18 | vía `192.168.123.1`, **0.55 ms**, 8000 y 8089 abiertos |
 
 ### 3.2. Falta, y hay que construirlo
 
 | Falta | Comentario |
 |---|---|
-| **El bridge de telemetría** | No existe nada. Hoy **nada del stack lee `/lowstate`**: el executor solo publica comandos y el bridge de cámara solo lee imágenes. Es código nuevo de verdad. |
-| **HEC habilitado en Splunk** | Puerto 8088 **cerrado** — verificado. Es la primera acción del lado de Splunk. |
+| **El agente de telemetría** | No existe nada. Hoy **nada del stack lee `/lowstate`**. Código nuevo de verdad. |
+| **HEC habilitado en Splunk** | Puerto 8088 **cerrado** — verificado. Primera acción del lado de Splunk. |
 | Index + token HEC | No creados. |
-| Censo de topics del Go2 | Necesita el robot prendido. Define las tasas reales (§4). |
+| Abrir tcp/8088 hacia `10.1.254.0/24` en el firewall de HQ | El transporte ya existe (VPN del IR1101, §8); solo falta el puerto |
+
+
 | Dashboard | No existe. |
-| Definición de topología de red para dos robots | **Decisión abierta y bloqueante para el segundo robot** (§5.3). |
 
-### 3.3. Cosas del plan original que hay que descartar
+### 3.3. Cosas descartadas (y por qué)
 
-| Del plan original | Por qué no |
+| Descartado | Motivo |
 |---|---|
-| Instalar ROS2 en una VM nueva (§3.1) | Ubuntu 26.04 no tiene Humble. Y `ros-humble-desktop` pelado **no trae los msgs de Unitree**, así que `get_message()` falla en todos los topics del robot. Usamos el SDK nativo (§7.1). |
-| Bridge que se suscribe a **todos** los topics | Rompe el presupuesto por 20-1700x (§4) y mandaría el video a Splunk. |
-| Un POST HEC por mensaje, síncrono, en el callback | Bloquea el receptor DDS y pierde muestras. Va con cola + batching (§7.2). |
-| Indexar `/rosout` como fuente de logs (§4.5) | Los servicios del robot son *bare DDS apps* (`_CREATED_BY_BARE_DDS_APP_`), no nodos ROS2 → no loguean en `/rosout`. Los logs del robot salen por otro lado o no salen. |
-| Panel de iframe en Dashboard Studio (§5.2) | Dashboard Studio no tiene panel HTML. El `<html>` embebido es de Simple XML (§9). |
-| "Los robots ya están en segmentos separados" | Falso hoy. Ver §5.3 — y con el conflicto de IP es peor de lo que parecía. |
-| `timechart avg(data.velocity)` sobre `/joint_states` | `velocity` es un array de N joints, no un escalar. Hay que aplanar por joint en el bridge. |
+| Instalar ROS2 en una VM nueva | Ubuntu 26.04 no tiene Humble, y `ros-humble-desktop` pelado **no trae los msgs de Unitree**. Se usa el SDK nativo (§7.1) |
+| Agente que se suscribe a **todos** los tópicos | Rompe el presupuesto por 20-1700x y mandaría el video a Splunk |
+| Un POST HEC por mensaje, síncrono, en el callback | Bloquea el receptor DDS y pierde muestras |
+| Indexar `/rosout` | Los servicios del robot son *bare DDS apps*, no nodos ROS2 → no loguean ahí |
+| Iframe en Dashboard Studio | No tiene panel HTML; eso es Simple XML (§10) |
+| **VM collector con presencia L2 / VLAN por robot / trunk** | Incompatible con el requisito de movilidad (§2.1 Opción D) |
+| **Túnel L2 para traer la red del robot** | §2.1 Opción B — imposible para dos robots por el conflicto de `.161` |
+| `timechart avg(data.velocity)` sobre `/joint_states` | Es un array de N joints, no un escalar. Hay que aplanar por joint |
 
 ---
 
-## 4. Restricciones duras (esto define el diseño)
+## 4. El conflicto de IP: neutralizado, no resuelto
 
-### 4.1. Presupuesto de licencia
+Los dos robots usan `192.168.123.161` para el bajo nivel (Go2 alto nivel `.18`, G1 alto nivel
+`.164`). Detalle completo en `RED-Y-DDS.md` §4.
 
-**500 MB/día**, hasta el **25 de agosto** (trial de Splunk Enterprise). Splunk licencia por
-**bytes crudos ingestados**, así que el tamaño del JSON *es* el consumo. Y el presupuesto es
-**compartido con otra persona** que está armando otro dashboard en la misma instancia — así
-que el número real disponible es menor y desconocido.
+**Con el agente adentro del robot, esto deja de ser un problema para la telemetría:** cada
+`.161` queda privado dentro de su robot y nunca se expone. N robots pueden tener la misma IP
+sin pisarse.
 
-La aritmética que mata al diseño original: 500 MB/día = **6 KB/s sostenidos**.
+**Pero sigue siendo un problema para todo lo demás.** Si los dos robots se conectan a la vez a
+la misma LAN local, sigue habiendo conflicto de IP para el pipeline de video y para AI-VL, que
+leen DDS desde afuera del robot. Ese tema sigue abierto en `robot-nvr-bridge/docs/DOS-ROBOTS.md`.
+Este plan lo **esquiva**, no lo arregla.
+
+---
+
+## 5. Restricciones duras
+
+### 5.1. Presupuesto de licencia
+
+**500 MB/día** hasta el **25 de agosto** (trial de Splunk Enterprise), **compartido con otra
+persona** que está armando otro dashboard — así que el disponible real es menor y desconocido.
+Splunk licencia **bytes crudos ingestados**: el tamaño del JSON *es* el consumo.
+
+500 MB/día = **6 KB/s sostenidos**.
 
 | Enfoque | Volumen/día | vs. presupuesto |
 |---|---|---|
-| `rt/lowstate` completo (medido: 1041 Hz, 2.2 MB/s) reenviado tal cual | ~860 GB | **1.700x** |
-| `rt/lf/lowstate` (20 Hz, 42 KB/s) reenviado tal cual | ~11-18 GB | **20-35x** |
+| `/lowstate` del **Go2** (medido: 500 Hz, 1,18 KB, 593 KB/s) tal cual, en crudo | **51 GB** | **100x** |
+| `/lf/lowstate` del Go2 (20 Hz, 23,8 KB/s) tal cual, en crudo | 2,06 GB | **4x** |
+| `/lf/lowstate` expandido a JSON (lo que Splunk cobra) | ~6-10 GB | **12-20x** |
+| *(referencia G1, medido antes: `/lowstate` a 1041 Hz / 2,2 MB/s)* | *~190 GB* | *~380x* |
 | Campos curados a 3 s (§6) | **~45 MB** | **9%** |
 
-El número clave es el del medio: **incluso el topic "liviano", reenviado tal cual, es 20-35x
-el presupuesto.** No hay downsample de topics que salve el enfoque de reenvío; hay que
-extraer campos.
+El número clave es el tercero: **ni el tópico liviano entra, una vez expandido a JSON.** No hay
+downsample de tópicos que salve el enfoque de reenvío; hay que extraer campos. (Todo medido sobre
+el Go2 real — ver `CENSO-GO2.md`.)
 
-**Mitigación adicional:** el bridge lleva su **propio contador de bytes diario** con un techo
-configurable (arranca en **150 MB/día**). Al llegar al techo deja de enviar y lo loguea. Así
-no existe el escenario de comernos la licencia y romperle el dashboard al otro usuario. Con
-45 MB estimados hay 3x de colchón antes de que el cap actúe.
+**Mitigación:** el agente lleva su **propio contador de bytes diario** con techo configurable
+(arranca en **150 MB/día**). Al llegar, deja de enviar y lo loguea. Así no existe el escenario
+de comernos la licencia compartida.
 
-> Aclaración porque se confunde seguido: **la retención no reduce el consumo de licencia.**
-> La licencia cuenta lo ingestado, no lo almacenado. Poner 2 días de retención ahorra disco,
-> no MB de licencia.
+> La **retención no reduce el consumo de licencia**: la licencia cuenta ingesta, no
+> almacenamiento.
 
-### 4.2. Deadline
+### 5.2. Deadline
 
-El trial vence el **25/08** — 7 días. Eso ordena las prioridades: primero que el dato
-**llegue y se vea**, después que la infra quede prolija. Todo lo que sea setup de
-infraestructura que se pueda hacer después del 25, se hace después del 25.
+El trial vence el **25/08**. Prioridad: que el dato llegue y se vea; la prolijidad de infra
+después. Y con los dos robots apagados, el despliegue en el robot **no se puede hacer todavía**
+— de ahí el orden de §11.
 
-### 4.3. Conflicto de IP entre los dos robots
+### 5.3. DDS no cruza routers
 
-Direcciones reales:
-
-| Robot | Bajo nivel (DDS) | Alto nivel (SSH) |
-|---|---|---|
-| Go2 (perro) | `192.168.123.161` | `192.168.123.18` |
-| G1 (humanoide) | `192.168.123.161` | `192.168.123.164` |
-
-**Los dos robots usan `192.168.123.161`.** Esto es más grave que la colisión de topics DDS
-que ya estaba documentada en `robot-nvr-bridge/docs/DOS-ROBOTS.md`: con los dos en el mismo
-segmento L2 hay **conflicto de IP**, no solo mezcla de datos. Consecuencias:
-
-- Los dos robots en la misma red **es imposible**, no "desprolijo". Cualquier medición hecha
-  con los dos conectados a la vez es sospechosa retroactivamente.
-- **Separar por VLAN pasa a ser obligatorio**, no una opción de diseño.
-- La "Opción A" (dominio DDS por robot) del doc `DOS-ROBOTS.md` **no alcanza sola**: cambiar
-  el dominio DDS no arregla un conflicto de IP.
-- El único camino que resuelve las dos cosas de una es **una VLAN por robot** (la "Opción B"),
-  porque la IP `.161` puede repetirse sin problema si está en segmentos L2 distintos.
-
-### 4.4. DDS no cruza routers
-
-El discovery de DDS es multicast y el multicast es link-local. Y además el robot **anuncia
-únicamente locators `192.168.123.x`** (medidos 3022, cero en otra subred). Por lo tanto:
-**quien lea DDS necesita presencia L2 en la red del robot.** Tener ruta no alcanza. Esto ya
-lo comprobamos por las malas con el G1 por WiFi.
+Discovery multicast link-local + el robot anuncia **solo locators `192.168.123.x`** (3022
+medidos, cero en otra subred) + probablemente sin default gateway. Detalle en `RED-Y-DDS.md`
+§2-§3. **Esta restricción es la que motiva toda la Decisión 2.**
 
 ---
 
-## 5. Dónde va el collector
+## 6. Contrato de datos
 
-### 5.1. Las opciones
-
-**Opción 1 — Esta PC (`ia-pc`, `192.168.123.99`, `enp4s0`)**
-
-| Pros | Contras |
-|---|---|
-| Ya tiene pata L2 en la red del robot | Es una **workstation**: se apaga, se reinicia, alguien la usa |
-| SDK ya compilado y probado en Ubuntu 26.04 | Sin backup ni monitoreo de server |
-| Camino a Splunk verificado (0.55 ms) | Para dos robots necesitaría una segunda NIC física o VLANs taggeadas hacia ella (hoy solo `enp4s0` activa; `wlp3s0` down) |
-| El video ya sale de acá → todo en un lugar | Acopla telemetría y video: un problema afecta a los dos |
-| **Setup: cero.** Se puede tener dato en Splunk hoy | |
-
-**Opción 2 — VM `Splunk-collector` en `TRUNK ITINERANTE` (VLAN 4095 / VGT)**
-
-| Pros | Contras |
-|---|---|
-| **Escala a N robots sin hardware**: una sub-interfaz taggeada por VLAN de robot (`ens160.X`), y CycloneDDS bindeado por interfaz → es exactamente la "Opción B" de `SEPARAR_ROBOTS_MULTIPLES.md` | Requiere que el puerto físico que alimenta `vmnic3` **trunkee la VLAN de los robots** — **a verificar** |
-| Es un server: uptime, snapshots, backup | Hay que configurar netplan con VLANs taggeadas (el tagging lo hace el guest, no el vSwitch) |
-| Ya está atachada al portgroup correcto — **no hay que crear nada en el vSwitch** | Si es Ubuntu 26.04 como la de Splunk: no hay ROS2 → SDK nativo (que es el camino elegido igual) |
-| Misma vSwitch que Splunk: con una sub-interfaz en VLAN 20, el tráfico HEC **no sale del host** | Hay que compilar el SDK ahí (~1 h si sale bien) |
-| Desacopla telemetría de video (fallas independientes) | **No puede hacer el video**: mediamtx/Frigate siguen en esta PC. No es problema, pero hay que saberlo |
-
-**Opción 3 — VM en VLAN 20 sin trunk** — ❌ **No funciona.** Es el escenario de §4.4: el
-multicast no cruza y el robot anuncia solo `123.x`. Descartada por evidencia, no por opinión.
-
-**Opción 4 — Dentro del devcontainer Humble de esta PC** — sirve para prototipar (ROS2 ya
-anda) pero es el peor destino final: depende de que VS Code levante un contenedor de 7,67 GB.
-
-### 5.2. Recomendación
-
-**Empezar en la Opción 1, migrar a la Opción 2 cuando se defina la topología de robots.**
-
-Razones:
-
-1. **El trial vence en 7 días.** Arrancar por la VM gasta el trial en setup de infra en vez de
-   en validar que el dato sirve. En esta PC hay dato en Splunk el día 1.
-2. **La decisión de topología todavía está abierta**, y es justo la que define cómo se
-   configura la VM (qué VLANs taggear). Configurarla antes de esa decisión es trabajo que se
-   rehace.
-3. **La migración es barata si el bridge se escribe portable**: todo por variables de entorno
-   (interfaz DDS, nombre del robot, URL y token de HEC, tasas, cap de bytes). Migrar = compilar
-   el SDK en la VM + netplan + copiar el systemd unit. Nada de código cambia.
-
-La Opción 2 **es el destino final correcto** — sobre todo por el punto de escalar a dos robots
-con sub-interfaces taggeadas, que resuelve de una el conflicto de IP y la colisión de topics
-sin comprar nada.
-
-### 5.3. Decisión abierta que bloquea al segundo robot
-
-Cómo se separan los dos robots. Con el conflicto de IP de §4.3, la respuesta casi forzada es
-**una VLAN por robot, y el collector con una sub-interfaz taggeada en cada una**. Falta
-confirmar:
-
-- [ ] Qué **VLAN ID** tiene hoy el segmento de los robots (`192.168.123.0/24`). No es
-      necesariamente 123 — el número de subred y el ID de VLAN son cosas distintas.
-- [ ] Si esa VLAN llega **trunkeada** al puerto físico del ESXi (`vmnic3`).
-- [ ] Qué VLAN nueva se usaría para el segundo robot.
-- [ ] Cómo entra el G1 (el CURWB bridgea a nivel L2, así que cae en la VLAN del puerto donde
-      está el Mesh End — eso define en qué VLAN termina el G1).
-
-Mientras esto no esté definido: **un robot, el Go2, por cable.**
-
----
-
-## 6. Contrato de datos (el corazón del diseño)
-
-Cuatro sourcetypes, todos al index `robot_data`, todos con `robot=go2` y `time` del reloj del
-evento (no de recepción — sin eso no se puede correlacionar con el video).
+Todo al índice `go2-robot-data`, con `robot=<nombre>` y **`time` del reloj del evento** (no de
+recepción — sin eso no hay correlación con el video, y con buffering en el campo los eventos
+pueden llegar minutos tarde).
 
 | Sourcetype | Origen DDS | Cadencia | Tamaño est. | Día est. |
 |---|---|---|---|---|
-| `robot:vitals` | `rt/lowstate` → `bms_state`, `imu_state`, `power_v/a`, temps, `bit_flag` | 3 s | ~500 B | 14 MB |
-| `robot:motors` | `rt/lowstate` → `motor_state[]` (12 del Go2): `q`, `tau_est`, `temperature`, `lost` | 3 s | ~2 KB | 21 MB |
-| `robot:pose` | `rt/sportmodestate` → `position`, `velocity`, `yaw_speed`, `body_height`, `gait_type`, `mode` | 3 s | ~250 B | 7 MB |
-| `robot:health` | derivado: `last_seen` + Hz medido por topic + estado de lidar | 10 s | ~300 B | 3 MB |
-| `robot:event` | discreto: cambio de `mode`/`gait_type`, `error_code` ≠ 0, temp > umbral, robot caído/vuelto | por evento | ~300 B | ~1 MB |
-| **Total** | | | | **~45 MB (9%)** |
+| `robot:vitals` | **`/lf/lowstate`** → `bms_state`, `imu_state`, `power_v/a`, temps, `bit_flag` | 3 s | **378 B** | **10,4 MB** |
+| `robot:motors` | **`/lf/lowstate`** → `motor_state[]` (12 del Go2): `q`, `tau_est`, `temperature`, `lost` | 3 s | **755 B** | **20,8 MB** |
+| `robot:pose` | **`/lf/sportmodestate`** → `position`, `velocity`, `yaw_speed`, `body_height`, `gait_type`, `mode` | 3 s | **246 B** | **6,8 MB** |
+| `robot:health` | derivado: Hz por tópico, `dds_alive`, bytes enviados vs cap, **backlog del spool** | 10 s | **237 B** | **2,0 MB** |
+| `robot:event` | **`/lf/battery_alarm`** + cambio de `mode`/`gait_type`, `error_code` ≠ 0, temp > umbral, robot caído/vuelto, enlace caído/vuelto | por evento | ~300 B | ~1 MB |
+| `robot:event` | discretos (ver abajo) | por evento | ~250 B | ~1 MB |
+| **Total** | | | | **40,0 MB — 8% del presupuesto** |
+
+> **Medido, no estimado** (2026-08-19): tamaños reales del JSON del colector de prueba
+> corriendo contra el Go2. Procedimiento en `IMPLEMENTACION.md` Etapa B.
 
 Notas de diseño:
 
-- **`robot:event` no se downsamplea.** Ahí está el valor real: un pico de temperatura de
-  200 ms se ve igual aunque la telemetría base vaya a 3 s.
-- **`robot:motors` va aplanado por joint** (`motors.FL_hip.temp`, no un array), si no no se
-  puede graficar en Splunk. Es el error del `avg(data.velocity)` del plan original.
-- **`robot:health` es el que da el panel de "sensor caído"** sin indexar los datos del sensor:
-  mide la tasa de los topics pesados y reporta solo el número.
-- **Denylist explícita de topics binarios** (`rt/frontvideostream`, `rt/api/videohub/response`,
-  point clouds, `rt/utlidar/*`): jamás se serializan. En el plan original habrían entrado
-  como arrays JSON de miles de enteros.
-- **El G1 usa `unitree_hg::LowState_`, el Go2 `unitree_go::LowState_`** (distinta cantidad de
-  motores y campos). El bridge tiene un mapeo por tipo de robot; los nombres de campo de
-  salida se normalizan para que el dashboard sea el mismo.
-- Todos los números de esta tabla son **estimaciones proyectadas de mediciones del G1**. Se
-  reemplazan por medidos en el paso 1 de §10.
+- **`robot:event` no se downsamplea.** Ahí está el valor: un pico de temperatura de 200 ms se ve
+  igual aunque la base vaya a 3 s.
+- **`robot:motors` va aplanado por joint** (`motors.FL_hip.temp`, no un array), si no no se puede
+  graficar. Es el error del `avg(data.velocity)` del plan original.
+- **`robot:health` da el panel de "sensor caído"** sin indexar los datos del sensor: mide la tasa
+  de los tópicos pesados y reporta el número. Con el agente en el campo, además reporta **estado
+  del enlace y cuánto backlog tiene el spool** — telemetría del propio agente.
+- **Denylist explícita de tópicos binarios** (`rt/frontvideostream`, `rt/api/videohub/response`,
+  point clouds, `rt/utlidar/*`): jamás se serializan.
+- **El G1 usa `unitree_hg::LowState_`, el Go2 `unitree_go::LowState_`.** Mapeo por tipo de robot,
+  nombres de salida normalizados para que el dashboard sea el mismo.
+- **Suscribir `/lf/*`, NO los tópicos de alta frecuencia.** Medido en el Go2 el 2026-08-19:
+  `/lf/lowstate` trae **los mismos datos a 20 Hz** que `/lowstate` a 500 Hz, con el mismo tamaño
+  de mensaje (1,18 KB) — **25x menos tráfico DDS, dato idéntico**. Censo completo en
+  `CENSO-GO2.md`.
+- **`round()` sobre un `float32` de numpy no redondea**: devuelve un numpy float que serializa
+  como `-0.014299999922513962` en vez de `-0.0143`. Hay que hacer `round(float(x), 4)`. Detectado
+  midiendo — inflaba el JSON sin necesidad.
 
 ---
 
-## 7. El bridge
+## 7. El agente
 
 ### 7.1. Por qué SDK nativo y no ROS2
 
 | | SDK nativo (C++) | ROS2 (rclpy) |
 |---|---|---|
-| Corre en Ubuntu 26.04 | Sí, ya probado en `robot-nvr-bridge` | No — solo en Docker (imagen de 7,67 GB) |
-| Dependencias en el collector | El SDK y nada más | ROS2 + CycloneDDS 0.10.x + 3 paquetes de msgs compilados |
-| Tipos de los dos robots | `idl/go2/` y `idl/hg/`, ya en el repo | `unitree_go` + `unitree_hg` + `unitree_api`, hay que buildearlos |
+| Corre en Ubuntu 26.04 (esta PC) | Sí, probado en `robot-nvr-bridge` | No — solo en Docker (7,67 GB) |
+| **Corre en el Jetson del robot** | **Sí: libs aarch64 precompiladas en el repo** | PC2 tiene Foxy pelado, sin CycloneDDS como RMW ni los msgs de Unitree |
+| Dependencias a instalar en el robot | El SDK y nada más | ROS2 + CycloneDDS 0.10.x + 3 paquetes de msgs compilados |
+| Tipos de los dos robots | `idl/go2/` y `idl/hg/`, ya en el repo | Hay que buildear `unitree_go` + `unitree_hg` + `unitree_api` |
 | Introspección genérica de mensajes | No tiene | Sí (`message_to_ordereddict`) |
 
-El último punto parece una ventaja de ROS2 pero **no nos sirve**: el diseño de §6 elige campos
-a mano, no serializa mensajes enteros. Justamente lo que ROS2 aporta es lo que hay que evitar.
-
-El patrón está probado: `robot-nvr-bridge/src/go2_jpeg_stream.cpp` ya compila contra
-`libunitree_sdk2.a` en esta máquina y lee DDS del robot.
+La última fila parece una ventaja de ROS2 pero **no nos sirve**: §6 elige campos a mano. Y con
+la Decisión 2, la fila que decide es la segunda: **meter ROS2 en el robot es invasivo y frágil;
+el SDK nativo es un binario estático.**
 
 ### 7.2. Componentes
 
-Mismo patrón que `robot-nvr-bridge` (C++ captura → stdout → proceso que despacha):
-
 ```
-telemetry_reader (C++)                      hec_shipper (Python)
-├─ CycloneDDS bindeado a la interfaz         ├─ lee NDJSON de stdin
-│  del robot (CYCLONEDDS_URI)                ├─ cola acotada (descarta lo viejo, no bloquea)
-├─ suscribe rt/lowstate, rt/sportmodestate   ├─ batching: N eventos o T ms por POST
-├─ QoS BEST_EFFORT (no RELIABLE)             ├─ campo `time` del evento
-├─ decima a la cadencia configurada          ├─ contador de bytes diario + cap
-├─ extrae SOLO los campos del contrato       ├─ reintento con backoff, sin flood de logs
-└─ emite una línea JSON por evento           └─ POST a /services/collector/event
+telemetry_reader (C++, en el robot)          hec_shipper (en el robot)
+├─ CycloneDDS bindeado a la interfaz          ├─ lee NDJSON de stdin
+│  interna del robot                          ├─ cola en memoria + SPOOL EN DISCO acotado
+├─ suscribe rt/lowstate, rt/sportmodestate    ├─ batching: N eventos o T ms por POST
+├─ QoS BEST_EFFORT (no RELIABLE)              ├─ campo `time` del evento, no de envío
+├─ decima a la cadencia configurada           ├─ contador de bytes diario + cap
+├─ extrae SOLO los campos del contrato        ├─ reintento con backoff, sin flood de logs
+└─ emite una línea JSON por evento            └─ POST a /services/collector/event
 ```
 
 Decisiones y por qué:
 
-- **QoS BEST_EFFORT en el lector.** Es compatible con escritores RELIABLE (esa dirección sí
-  matchea) y evita las tormentas de NACK/retransmisión si algún día el enlace es inalámbrico.
-  Con RELIABLE + depth 10, además, no matchea escritores BEST_EFFORT.
-- **La decimación va en el lector, no en el shipper.** Descartar temprano: lo que no se
-  serializa no cuesta nada.
-- **Cola acotada que descarta lo viejo.** Si Splunk no responde, el bridge no puede frenar la
-  recepción DDS ni crecer sin límite. Telemetría vieja no sirve; se tira.
-- **`time` explícito en cada evento.** Sin esto Splunk sella con hora de recepción y se pierde
-  la correlación con el video, que es la mitad del valor del dashboard.
+- **QoS BEST_EFFORT en el lector.** Compatible con escritores RELIABLE (esa dirección matchea) y
+  evita tormentas de NACK. Con RELIABLE + depth 10 además no matchea escritores BEST_EFFORT.
+- **Decimar en el lector, no en el shipper.** Lo que no se serializa no cuesta nada.
+- **Spool en disco acotado (nuevo, por el requisito de movilidad).** En el campo el enlace se
+  corta. El agente escribe a un ring buffer en disco (arranca en 50 MB) y drena cuando vuelve la
+  conectividad. Como cada evento lleva su `time`, los eventos atrasados **caen en el timestamp
+  correcto** en Splunk. Sin el spool, un corte de enlace = agujero permanente.
+- **Cola en memoria que descarta lo viejo** entre el reader y el spool: el agente nunca puede
+  frenar la recepción DDS ni crecer sin límite.
 - **Todo por env vars** (`ROBOT_NAME`, `ROBOT_TYPE`, `DDS_IFACE`, `HEC_URL`, `HEC_TOKEN`,
-  `RATE_*`, `DAILY_BYTE_CAP`): es lo que hace barata la migración de §5.2.
+  `RATE_*`, `DAILY_BYTE_CAP`, `SPOOL_MB`): es lo que permite correrlo en el robot, en esta PC o
+  en una VM **sin cambiar código**.
 - **systemd con `Restart=always`**, igual que `robot-nvr.service`, que ya demostró recuperarse
   solo cuando el robot se cae y vuelve.
 
-### 7.3. Dónde vive el código
+### 7.3. Reglas de convivencia con el robot
 
-Repo nuevo `robot-splunk-bridge`, hermano de los otros en `~/Desktop`. **El código y sus
-comentarios en inglés** (convención del ecosistema); este plan queda en castellano para
-acompañar al doc original.
+El agente corre en una computadora que hace mover un robot. No negociable:
+
+- **Read-only:** suscribe y nada más. No publica en **ningún** tópico de comando. Sin excepción.
+- **Límites de recursos** por systemd (`MemoryMax`, `CPUQuota`) para que no pueda competir con el
+  control.
+- **Nice bajo** y `Restart=always` pero con `StartLimitBurst` para no entrar en loop de crasheo.
+- Escribe **solo** en su directorio de spool, con tamaño acotado. Nunca puede llenar el disco del
+  robot.
+- Se instala **sin tocar nada existente** del robot: su propio directorio, su propio unit.
+
+### 7.4. El reloj
+
+Si el reloj del robot está corrido, los eventos caen con timestamp equivocado y el dashboard
+miente. **Verificado 2026-08-19 en el Jetson del Go2: NTP activo y sincronizado, hora correcta en
+UTC** — la zona horaria es Asia/Shanghai (default de fábrica), lo que **no importa** siempre que el
+agente emita **epoch** y no una hora local formateada. Igual el agente reporta su offset en
+`robot:health`, para que un robot con el reloj corrido se detecte en el dashboard en vez de mentir
+en silencio.
+
+### 7.5. Dónde vive el código
+
+Repo nuevo `robot-splunk-bridge`, hermano de los otros en `~/Desktop`, con dos targets de build
+(x86_64 para pruebas locales, aarch64 para el robot). **Código y comentarios en inglés**
+(convención del ecosistema); los docs de planificación en castellano.
 
 ---
 
-## 8. Splunk
+## 8. El camino del robot a Splunk — ya resuelto
 
-1. **Habilitar HEC** — hoy el 8088 está cerrado. Settings → Data Inputs → HTTP Event
-   Collector → Global Settings → habilitar, SSL on.
-2. **Index `robot_data`** con retención de 2 días (`frozenTimePeriodInSecs = 172800`).
-3. **Un token HEC compartido** para los dos robots (el campo `robot` los distingue). Es más
-   simple de mantener que uno por robot — eso el plan original lo tiene bien.
+Cuando escribí este plan lo puse como la decisión abierta principal. **No lo es: ya existe.**
+Está documentado en `PLAN-CONECTIVIDAD-ROBOTS.md`, que es la autoridad sobre la parte de red:
+
+| Pieza | Estado |
+|---|---|
+| **VPN IKEv2 IR1101 → Meraki MX (HQ)** | **Operativa** |
+| NAT del Jetson: `192.168.123.18` → `10.1.254.18` | **Operativa**, ping desde HQ OK |
+| Uplink de campo | **Starlink Mini** (bypass de CGNAT, IP SLA keepalive configurado) |
+| Contenedor ThousandEyes (IOx) en el IR1101 | RUNNING, **intocable** |
+
+Y es exactamente la forma correcta según la tesis del diseño: **el túnel lleva HTTPS, no DDS.**
+El IR1101 le da al robot un segmento L2 propio que viaja con él, con salida VPN — así que el
+agente publica al HEC desde cualquier lado sin que DDS cruce nunca el router.
+
+**Verificado hoy (2026-08-19) desde el Jetson del Go2, por cable:**
+
+| Prueba | Resultado |
+|---|---|
+| Jetson → Splunk `192.168.20.200` | **0,74 ms** |
+| Jetson → `192.168.20.200:8000` | abierto |
+| Jetson → `192.168.20.200:8088` (HEC) | **cerrado** ← único bloqueo real |
+| Jetson → bajo nivel `192.168.123.161` | **0,25 ms** (mismo L2 → el DDS va a funcionar) |
+
+O sea: **el agente tiene los dos lados resueltos.** Ve el DDS del bajo nivel y alcanza Splunk.
+Lo único que falta del lado de la red es abrir tcp/8088 hacia `10.1.254.0/24` en el firewall de
+HQ, junto con habilitar el HEC (§9).
+
+## 9. Splunk
+
+1. **Habilitar HEC** — hoy el 8088 está cerrado. Settings → Data Inputs → HTTP Event Collector →
+   Global Settings → habilitar, SSL on.
+2. **Index `go2-robot-data`**, retención 2 días (`frozenTimePeriodInSecs = 172800`).
+3. **Un índice y un token POR ROBOT** — es lo que se construyó (2026-08-19): token `Go2-01` con
+   índice `go2-robot-data`. Difiere de lo que yo había recomendado (un índice compartido con el
+   campo `robot`), y está bien: da **retención y cuota independientes por robot** y permite revocar
+   un token sin afectar a los demás. El costo es que las búsquedas entre robots necesitan comodín
+   (`index=*robot-data`). El campo `robot` se sigue mandando igual, así que ninguna búsqueda se
+   rompe.
 4. **Confirmar qué index/sourcetype usa la otra persona** para no pisarle nada.
-5. **Prueba con `curl` antes de meter DDS en el medio** — el paso 4 del checklist original
-   está bien puesto y hay que respetarlo: valida el camino de red, el token y el index sin
-   ninguna variable de robot encima.
-6. Restringir el 8088 a la IP del collector.
+5. **Prueba con `curl` antes de meter DDS en el medio.** Valida red, token e index sin ninguna
+   variable de robot encima. El paso 4 del checklist original está bien puesto.
+6. Restringir el 8088 al origen que corresponda (rango de la VPN, no "cualquiera").
+7. **Con el agente en el robot, el token viaja en el robot.** Si un robot se pierde o se
+   compromete, hay que poder revocarlo — resuelto por el punto 3 (token por robot). ⚠️ Y la
+   password SSH del Jetson es `123`: cambiarla antes de dejar el token ahí.
+
+### 9.1. Estado verificado (2026-08-19)
+
+| Prueba | Resultado |
+|---|---|
+| `GET /services/collector/health` | `HEC is healthy` |
+| Token `Go2-01` | válido |
+| POST a `index=go2-robot-data` | **Success** |
+| PoC contra el HEC | **36 eventos, 15.944 B, 0 errores** |
+
+**Trampa que costó dos intentos:** si el índice que mandás no está en la lista permitida del
+token, Splunk responde `{"text":"Incorrect index","code":7}` — **incluso para `main`**. Y si
+omitís el campo `index`, usa el default del token y da `Success`. Así que "Success sin index +
+Incorrect index con cualquier nombre" significa **nombre de índice equivocado o no permitido**,
+no un problema de token ni de red.
 
 ---
 
-## 9. Video
+## 10. Video
 
-**Ya está resuelto, cuesta 0 MB de licencia.** mediamtx expone HLS en `:8888` y WebRTC en
-`:8889`. El panel es un `<iframe>` a `http://192.168.123.99:8889/robot`.
+**Hoy ya funciona y cuesta 0 MB de licencia**, con el robot en la LAN local: mediamtx expone HLS
+`:8888` y WebRTC `:8889` desde `robot-nvr-bridge`, y el panel es un `<iframe>` a
+`http://192.168.123.99:8889/robot`.
 
-Dos avisos:
+Dos avisos de Splunk:
 
-- **Va en un dashboard Simple XML con panel `<html>`, no en Dashboard Studio** (que no tiene
-  panel HTML). Al revés de lo que dice el plan original.
-- Puede hacer falta tocar `web.conf` por CSP / `X-Frame-Options` para que Splunk permita el
-  iframe.
-- Quien mire el dashboard tiene que poder alcanzar `192.168.123.99:8889`. Si el dashboard se
-  abre desde la VLAN 20, hay que confirmar que esa ruta existe en ese sentido (el sentido
-  inverso ya está verificado).
+- **Simple XML con panel `<html>`, no Dashboard Studio** (que no tiene panel HTML). Al revés de
+  lo que decía el plan original.
+- Puede hacer falta tocar `web.conf` por CSP / `X-Frame-Options`.
 
-Metadata de video **sí** puede ir a Splunk como eventos normales (inicio/fin de grabación,
-detecciones de Frigate) — es texto, cuesta nada, y sirve para correlacionar.
+**El caso del campo es harina de otro costal** y queda fuera de este plan: hoy la cadena
+JPEG→H.264→RTSP corre **en esta PC**, leyendo el video por DDS desde la LAN. Con el robot remoto
+habría que **encodear en el robot y empujar hacia afuera** (RTSP push / SRT / WebRTC hacia
+mediamtx). Dos notas para cuando se encare:
+
+- El Jetson del robot tiene encoder por hardware, y el **Go2 ya genera H.264 nativo**
+  (`rt/frontvideostream`). El fracaso conocido de leer ese tópico fue **desde afuera del robot**;
+  leerlo **localmente en el Jetson** es un test distinto y podría dar H.264 sin recodificar. Vale
+  la pena probarlo, no es una promesa.
+- El ancho de banda del video (Mbps) no tiene nada que ver con el de la telemetría (KB/s). Un
+  enlace satelital aguanta 1080p, pero con latencia y jitter — hay que bajar expectativas de
+  "vivo".
 
 ---
 
-## 10. Plan de ejecución hasta el 25/08
+## 11. Plan de ejecución
 
-Ordenado para que el dato llegue rápido y la infra quede prolija después.
+**Los dos robots están apagados**, así que el despliegue en el robot no se puede empezar. El
+orden aprovecha eso: se construye y se prueba local, y el despliegue al robot es el último paso
+— y **no cambia ni una línea de código**, solo variables de entorno.
+
+### Hasta el 25/08 (con el Go2 por cable en la LAN)
 
 | # | Paso | Necesita | Bloquea a |
 |---|---|---|---|
 | 0 | Habilitar HEC + index + token + `curl` de prueba | Acceso admin a Splunk | todo |
-| 1 | **Censo de topics del Go2**: 60 s de captura, tamaños y Hz reales por topic | **Robot prendido** (~2 min) | fijar las tasas de §6 con números medidos |
-| 2 | `telemetry_reader` (C++): DDS → NDJSON curado por stdout | paso 1 | 3 |
-| 3 | `hec_shipper` (Python): cola, batching, `time`, cap de bytes | paso 0 | 4 |
-| 4 | systemd + verificar en Splunk que llegan los 5 sourcetypes | | 5 |
-| 5 | Dashboard Simple XML: vitals + motores + errores + posición + iframe de video | paso 4, §9 | — |
+| 1 | ~~**Censo de tópicos del Go2**~~ ✅ **hecho 2026-08-19** → `CENSO-GO2.md` | — | — |
+| 2 | `telemetry_reader` (C++): DDS → NDJSON curado | paso 1 | 3 |
+| 3 | `hec_shipper`: cola, spool, batching, `time`, cap de bytes | paso 0 | 4 |
+| 4 | Correr el agente **en esta PC** contra el robot por cable, verificar los 5 sourcetypes en Splunk | pasos 2, 3 | 5 |
+| 5 | Dashboard Simple XML: vitals + motores + errores + posición + iframe de video | paso 4 | — |
 | 6 | Medir consumo real 24 h y ajustar cadencias | paso 4 | — |
 
-Después del 25 / cuando se defina la topología:
+### Después: llevarlo al robot
 
 | # | Paso |
 |---|---|
-| 7 | Confirmar VLAN ID de la red de robots y si llega trunkeada a `vmnic3` |
-| 8 | Migrar el bridge a la VM `Splunk-collector` (compilar SDK + netplan con VLAN taggeada + systemd) |
-| 9 | Definir VLAN del segundo robot y levantar la segunda instancia del bridge |
-| 10 | Alertas (ojo: si el trial cae a Splunk Free, **se pierde alerting**) |
+| 7 | ~~Inventariar el Jetson del Go2~~ ✅ **hecho 2026-08-19** — viable (ver §2.3) |
+| 8 | Compilar el agente para aarch64 y desplegarlo en el Jetson con su unit de systemd y sus límites (§7.3) |
+| 9 | Validar **con el cable externo desenchufado** — es el único test que vale (ver los falsos positivos en `RED-Y-DDS.md` §6) |
+| 10 | Resolver el camino a Splunk desde afuera (§8): VPN en el robot |
+| 11 | Prueba de campo real: cortar el enlace a propósito y confirmar que el spool drena sin perder datos ni duplicar |
+| 12 | Repetir para el G1 en PC2 (`.164`) |
+| 13 | Alertas (ojo: si el trial cae a Splunk Free, **se pierde alerting**) |
 
 ---
 
-## 11. Decisiones abiertas
+## 12. Decisiones abiertas
 
-- [ ] **VLAN ID** del segmento de robots, y si llega trunkeada a `vmnic3`. (§5.3)
-- [ ] Topología para dos robots — forzada hacia "una VLAN por robot" por el conflicto de IP. (§4.3)
-- [ ] Presupuesto de licencia post-25/08: ¿se compra más volumen o el diseño vive en 500 MB
-      para siempre? Y **qué queda después del 25** — si cae a Free, se pierden alerting y
-      autenticación, y el alerting es justo lo que querríamos para temperatura crítica.
-- [ ] Cuánto del presupuesto consume la otra persona (define el cap real del bridge).
-- [ ] Acceso: ¿creamos nosotros el index y el token, o lo hace infra?
+- [x] ~~Camino del robot al HEC desde afuera~~ — **resuelto**: VPN IKEv2 del IR1101 al Meraki MX,
+      ya operativa (§8). Falta abrir tcp/8088 hacia `10.1.254.0/24` en el firewall de HQ.
+- [ ] ¿Un token HEC por robot (revocable) o uno compartido? Recomiendo por robot (§9.7).
+- [x] ~~Acceso al Jetson del Go2~~ — SSH `unitree`, inventariado, y ya corre un agente de terceros.
+- [ ] **Cambiar la password del Jetson** (hoy es `123`) antes de dejar un token de Splunk ahí.
+- [ ] Presupuesto post-25/08: ¿se compra más volumen? ¿Y qué queda — si cae a Free, se pierden
+      alerting y autenticación, y el alerting es justo lo que querríamos para temperatura crítica.
+- [ ] Cuánto del presupuesto consume la otra persona (define el cap real del agente).
 - [ ] Certificado de Splunk: propio o autofirmado (define si el shipper valida TLS).
+- [ ] Video en el campo: fuera de alcance de este plan, decidir si se encara (§10).
+- [ ] Separación de los dos robots en la LAN local: este plan lo **esquiva**, pero sigue abierto
+      para video y AI-VL (§4).
 
 ---
 
-## 12. Riesgos
+## 13. Riesgos
 
 | Riesgo | Impacto | Mitigación |
 |---|---|---|
-| Nos comemos la licencia compartida | Le rompe el dashboard al otro usuario | Cap de bytes diario **en el bridge** (§4.1), no solo confiar en las cadencias |
-| El robot se cae/vuelve seguido (ya documentado como intermitente) | Huecos en la telemetría | `Restart=always` + `robot:event` de caída/retorno, que convierte el hueco en un dato |
-| Sobrecalentamiento del G1 (~104 °C, se apaga solo) | No aplica al Go2 ahora; sí cuando entre el G1 | Justamente es una de las métricas a monitorear — el dashboard sirve para esto |
-| El trial vence con el dashboard a medio hacer | Hay que rehacer la demo | Orden de §10: dato en Splunk primero, prolijidad después |
-| La VLAN de robots no llega trunkeada al ESXi | La Opción 2 se cae | El bridge queda en esta PC; el diseño no cambia, solo el host |
-| MTU 1500 en el vSwitch con tagging del guest | Muestras DDS grandes podrían fragmentar mal | Riesgo bajo: la telemetría son muestras chicas. Si aparece, es sospechoso #1 |
+| **El agente desestabiliza el robot** | Grave: es la computadora que lo hace caminar | §7.3: read-only, límites por systemd, spool acotado, instalación aislada |
+| Nos comemos la licencia compartida | Rompe el dashboard del otro usuario | Cap de bytes diario **en el agente**, no solo confiar en las cadencias |
+| El enlace del campo se corta | Agujeros en la telemetría | Spool en disco + `time` por evento → los datos llegan tarde pero **al timestamp correcto** |
+| El reloj del robot está corrido | El dashboard miente y no se puede correlacionar | ✅ Verificado 2026-08-19: NTP activo y sincronizado en el Jetson del Go2. Igual el agente emite **epoch** y reporta offset en `robot:health` |
+| El token HEC viaja en el robot | Un robot perdido = credencial expuesta | Token por robot, revocable (§9.7) |
+| El robot se cae/vuelve seguido (documentado como intermitente) | Huecos | `Restart=always` + `robot:event` de caída/retorno: el hueco se vuelve un dato |
+| Sobrecalentamiento del G1 (~104 °C, se apaga solo) | Aplica cuando entre el G1 | Es justamente una de las métricas a monitorear |
+| El trial vence con el dashboard a medio hacer | Hay que rehacer la demo | Orden de §11: dato en Splunk primero, robot después |
+| ~~No nos dejan instalar software en el robot~~ | ~~Se cae la arquitectura entera~~ | ✅ **Resuelto 2026-08-19**: ya corre un ThousandEyes agent (Cisco) en el Jetson del Go2, como contenedor Docker. Hay precedente y patrón |
+| **La pass de SSH del robot es `123`** | Un token HEC guardado ahí queda muy expuesto | Token **por robot**, revocable (§9.7); permisos restrictivos en el archivo; plantear el cambio de credencial al dueño del robot |

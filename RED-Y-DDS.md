@@ -7,11 +7,12 @@ verificado y qué no.
 Aplica a cualquier cosa que lea datos del robot: el bridge de telemetría a Splunk
 (`PLAN.md`), el pipeline de video (`robot-nvr-bridge`) y AI-VL.
 
-Última actualización: 2026-08-18.
+Última actualización: 2026-08-19 (se agregó §8.2-§8.4: el caso de robots en
+cualquier red).
 
 ---
 
-## 0. Resumen en cuatro hechos
+## 0. Resumen en cinco hechos
 
 1. **DDS no tiene servidor central.** No existe "la IP del tópico" para apuntarle. Los
    procesos se hablan directo entre sí, así que lo único que importa es si se pueden
@@ -23,6 +24,9 @@ Aplica a cualquier cosa que lea datos del robot: el bridge de telemetría a Splu
 4. **La consecuencia de diseño:** nunca se pasan tópicos DDS por la red. El proceso que lee DDS
    se pone **al lado del robot**, extrae los datos, y lo que cruza la red es **HTTP/RTSP**, que
    rutea sin drama. **DDS corto y local, HTTP largo y ruteado.**
+5. **Y si el robot puede estar en cualquier red** (campo, Starlink, LTE), "al lado del robot"
+   significa **adentro del robot**: es la única máquina que va a estar L2-adyacente a su propio
+   DDS, esté donde esté. Ver §8.2 — esto también hace desaparecer el problema del punto 2.
 
 ---
 
@@ -145,6 +149,10 @@ y solo difiere el alto nivel. (Ese doc habría que corregirlo.)
   hosts distintos con la misma IP. Sin NAT (que es peor), la presencia L2 por VLAN es
   obligatoria para el escenario de dos robots. **Esta conclusión no depende de ningún test.**
 
+> **Salvo que el lector esté adentro del robot** (§8.2): ahí cada `.161` queda privado y el
+> conflicto se neutraliza. Todo lo de arriba aplica a los consumidores que leen DDS **desde
+> afuera** del robot — hoy el pipeline de video y AI-VL.
+
 ---
 
 ## 5. Estado real de la red hoy
@@ -260,9 +268,11 @@ pipeline de video usa JPEG (`GetImageSample`, mensajes chicos y confiables) y no
 
 ## 8. Qué significa todo esto para el diseño
 
+### 8.1. La regla
+
 **No se pasan tópicos DDS por la red. Nunca.** El proceso que lee DDS se pone donde el DDS es
-fácil — mismo segmento L2 que el robot — extrae ahí los datos que importan, y lo que cruza la
-red es un protocolo ruteable:
+fácil — mismo segmento L2 que el robot — extrae ahí los datos que importan, y lo que cruza la red
+es un protocolo ruteable:
 
 | Consumidor | Lee DDS en | Cruza la red como |
 |---|---|---|
@@ -273,25 +283,78 @@ red es un protocolo ruteable:
 **DDS corto y local, HTTP largo y ruteado.** Por eso la única pregunta que importa al elegir
 dónde corre un proceso es *"¿puede ver DDS?"*, y todo lo demás se resuelve solo.
 
-Y para dos robots, "ver DDS" significa **una interfaz por robot**: física (dos NICs) o taggeada
-(sub-interfaces sobre un trunk). La VM `Splunk-collector` ya está en el portgroup correcto para
-esto último — `TRUNK ITINERANTE` en VLAN 4095 — así que no hay que tocar el vSwitch, solo el
-netplan del guest y confirmar que la VLAN llegue al puerto físico.
+### 8.2. Y si el robot puede estar en cualquier red
 
----
+Requisito planteado el 2026-08-19: los robots tienen que poder operar **desde cualquier lado** —
+el campo con Starlink, LTE, otra oficina. O sea que **no se puede asumir que compartan subred con
+nada**, y todas las soluciones de presencia L2 remota (VLAN por robot, sub-interfaces taggeadas,
+trunk hacia el ESXi, CURWB) dejan de alcanzar: sirven para un robot **local**, no para uno
+itinerante.
+
+La observación que resuelve el caso general:
+
+> **La única máquina que va a estar L2-adyacente al DDS del robot, esté el robot donde esté, es
+> el robot mismo.**
+
+Entonces el lector va **adentro del robot**. Cada robot tiene una computadora de alto nivel con
+acceso a su propio bus DDS (Go2: Jetson en `.123.18`; G1: PC2 en `.123.164`), y el SDK de Unitree
+trae **libs aarch64 precompiladas** (`lib/aarch64/`, `thirdparty/lib/aarch64/`), así que
+compilar ahí es un trámite. Lo que sale del robot es **HTTPS saliente**.
+
+Lo que se cae solo con esa decisión:
+
+- **El requisito de misma subred desaparece.** El robot reporta desde cualquier red con internet.
+- **El conflicto de `.161` (§4) se neutraliza**: la IP queda privada adentro de cada robot y nunca
+  se expone. N robots con la misma IP, sin pisarse.
+- **NAT deja de importar**: solo hay conexiones salientes, ningún puerto entrante.
+- **El ancho de banda pasa a ser trivial**: campos curados son KB/s, no los 2,2 MB/s de
+  `rt/lowstate`.
+
+### 8.3. El túnel es para el HTTPS, no para el DDS
+
+La tentación es tunelizar la red del robot (ZeroTier con bridging L2, WireGuard + bridge) para que
+un lector remoto crea que está en la misma LAN. **Es la peor opción de todas:**
+
+- DDS sobre WAN se degrada muy mal: con RTT alto, jitter y pérdida, la QoS RELIABLE se convierte
+  en tormentas de retransmisión.
+- Manda los tópicos **completos** por el enlace.
+- **Es imposible para dos robots**: dos túneles presentando `192.168.123.161` cada uno = conflicto
+  de IP del lado del server. No hay configuración que lo arregle.
+
+Sí hace falta un túnel, pero para otra cosa: para que el robot alcance el HEC de Splunk, que vive
+en una IP privada. Ese túnel lleva **HTTPS con reintentos**, que es exactamente el tráfico que
+tolera un enlace satelital.
+
+### 8.4. Cuándo sí sirve un DDS Router
+
+Si algún día hace falta **comandar** un robot remoto, o que AI-VL lo vea como si fuera local,
+extraer campos ya no alcanza: hacen falta los tópicos de verdad. Para eso están
+`zenoh-bridge-dds` y el DDS Router de eProsima, hechos para puentear DDS por WAN sin extender L2.
+Igual corren **adentro del robot** — el punto de §8.2 no cambia, solo cambia qué proceso se pone
+ahí.
 
 ## 9. Pendientes
 
-- [ ] **VLAN ID** del segmento de robots (≠ 123 necesariamente).
-- [ ] ¿Llega trunkeada a `vmnic3`?
+**Del caso itinerante (§8.2) — es el que manda ahora:**
+
+- [ ] Inventariar el Jetson de alto nivel del **Go2** (`192.168.123.18`): SSH, arquitectura,
+      espacio, versión de OS, salida a internet propia, NTP.
+- [ ] Confirmar **permiso para instalar un servicio en el robot**. Si no lo hay, se cae la
+      arquitectura y hay que volver a la presencia L2 con robots locales.
+- [ ] Definir cómo alcanza el robot el HEC de Splunk desde afuera (VPN vs endpoint publicado).
+- [ ] Verificar que el reloj del robot esté sincronizado (si no, los timestamps mienten).
+- [ ] Validar **con el cable externo desenchufado** — el único test que vale (§6).
+
+**Del caso local (sigue abierto para video y AI-VL, que leen DDS desde afuera del robot):**
+
 - [ ] **Tabla de rutas del robot** — ¿tiene default gateway? Define si un lector ruteado es
       posible para un robot solo. (2 min con el robot prendido)
-- [ ] Validar el CURWB **con el cable desenchufado**.
-- [ ] Definir la VLAN del segundo robot.
-- [ ] Corregir la tabla de IPs de `robot-nvr-bridge/docs/DOS-ROBOTS.md` y revisar sus
-      conclusiones a la luz del conflicto de `.161`.
-
----
+- [ ] **VLAN ID** del segmento de robots (≠ 123 necesariamente) y si llega trunkeada a `vmnic3`.
+- [ ] Cómo se separan los dos robots si están los dos en la LAN local (el conflicto de `.161`
+      sigue vivo ahí).
+- [ ] Validar el CURWB con el cable desenchufado.
+- [ ] Corregir la tabla de IPs de `robot-nvr-bridge/docs/DOS-ROBOTS.md` y revisar sus conclusiones
+      a la luz del conflicto de `.161`.
 
 ## 10. Documentos relacionados
 
