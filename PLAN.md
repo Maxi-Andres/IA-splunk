@@ -441,7 +441,14 @@ Dos avisos de Splunk:
 
 - **Simple XML con panel `<html>`, no Dashboard Studio** (que no tiene panel HTML). Al revés de
   lo que decía el plan original.
-- Puede hacer falta tocar `web.conf` por CSP / `X-Frame-Options`.
+- ⚠️ **Pero el video NO se puede embeber igual** (verificado 2026-08-19): el sanitizador de
+  Simple XML de Splunk 9 **elimina el tag `<iframe>`** — el elemento no llega al navegador. No
+  es el diálogo de "Dashboards Trusted Domains" ni CSP: no hay setting que lo habilite. La
+  única vía sería un archivo sin sanitizar bajo `appserver/static/` de una app, que requiere
+  acceso al filesystem del servidor de Splunk.
+- **Decisión tomada:** el dashboard lleva **accesos directos** al video (Frigate, WebRTC, HLS)
+  en vez de un embed. Splunk queda para telemetría y series temporales; Frigate para video,
+  que además es un visor mucho mejor (timeline, grabaciones, detección).
 
 **El caso del campo es harina de otro costal** y queda fuera de este plan: hoy la cadena
 JPEG→H.264→RTSP corre **en esta PC**, leyendo el video por DDS desde la LAN. Con el robot remoto
