@@ -92,6 +92,10 @@ Esperado: `robot:vitals`, `robot:motors`, `robot:pose`, `robot:health`.
 
 **Criterio de salida:** los cuatro sourcetypes en Splunk, sostenido 1 hora.
 
+> Nota: la Etapa B fue el andamio para validar el contrato de datos. Con la Etapa D andando
+> (agente nativo dentro del robot), **el PoC ya no se usa** — queda en el repo como
+> referencia y para probar contra un robot en la LAN sin desplegar nada.
+
 ---
 
 ## Etapa C — Probar que el DDS NO cruza de red
@@ -265,6 +269,24 @@ cortarlo con Ctrl-C.
 ✅ **Qué mirar:** la línea `[shipper] up: url=...` y **silencio después**. El shipper solo
 habla cuando algo falla, así que sin mensajes = todo entrando. Y en Splunk,
 `index=go2-robot-data` empieza a llenarse.
+
+✅ **EJECUTADO 2026-08-19 — funcionó.** Spool pendiente en **0** (Splunk aceptó todos los
+POST) con el agente corriendo dentro del robot y esta PC en la VLAN 20 sin ver un solo
+tópico DDS. **Objetivo cumplido.**
+
+Consumo medido, contra un techo de 256 MB / 25%:
+
+| Proceso | CPU | RSS |
+|---|---|---|
+| `telemetry_reader` | 1,2% | 9 MB |
+| `hec_shipper.py` | 0,4% | 16 MB |
+
+El Jetson quedó en load average **0,09** — el agente es invisible para el robot.
+
+⚠️ **Trampa al monitorearlo:** el binario se llama `telemetry_reader`, **16 caracteres**, y
+el kernel trunca `comm` a 15 → en `/proc` figura como `telemetry_reade`. Por eso
+`ps -C telemetry_reader` y `pgrep telemetry_reader` **no lo encuentran estando vivo**.
+Cualquier health check tiene que usar **`pgrep -f`**.
 
 ### D6 — Dejarlo una hora a mano
 

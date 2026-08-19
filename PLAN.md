@@ -123,7 +123,7 @@ a su conclusión: si el DDS tiene que ser local, entonces el lector va donde est
 
 | Robot | Host del agente | Acceso | Estado |
 |---|---|---|---|
-| **Go2** | Jetson `192.168.123.18` | SSH `unitree` | ✅ **Inventariado 2026-08-19 — viable** (abajo) |
+| **Go2** | Jetson `192.168.123.18` | SSH `unitree` | ✅ **AGENTE DESPLEGADO Y FUNCIONANDO** (2026-08-19) |
 | **G1** | PC2 / Jetson `192.168.123.164` (aarch64, Ubuntu 20.04) | SSH | Lectura de DDS de PC1 por bus interno **ya validada** |
 
 ### Inventario del Jetson del Go2 (verificado 2026-08-19)
